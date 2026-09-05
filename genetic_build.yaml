@@ -1,0 +1,186 @@
+name: Genetic Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Genetic"
+        required: true
+        type: string
+      tag:
+        description: "Nama/tag build"
+        required: true
+        type: string
+      build_type:
+        description: "Build type"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Download project ZIP
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/genetic"
+          curl -fL --retry 4 --retry-delay 2 --connect-timeout 20 \
+            "$ZIP_URL" -o "$RUNNER_TEMP/project.zip"
+          test -s "$RUNNER_TEMP/project.zip"
+
+      - name: Extract and detect Genetic project
+        run: |
+          set -euo pipefail
+          PROJECT="$RUNNER_TEMP/genetic/project"
+          mkdir -p "$PROJECT"
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$PROJECT"
+
+          # Handle ZIPs that contain one top-level folder.
+          if [ ! -d "$PROJECT/android" ] && [ "$(find "$PROJECT" -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ]; then
+            ROOT_DIR="$(find "$PROJECT" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [ -d "$ROOT_DIR/android" ]; then
+              mv "$ROOT_DIR"/* "$PROJECT"/ 2>/dev/null || true
+              mv "$ROOT_DIR"/.[!.]* "$PROJECT"/ 2>/dev/null || true
+              rmdir "$ROOT_DIR" 2>/dev/null || true
+            fi
+          fi
+
+          if [ ! -d "$PROJECT/android" ]; then
+            echo "ERROR: folder android/ tidak ditemukan. Ini bukan struktur Genetic yang didukung."
+            exit 1
+          fi
+
+          ANDROID="$PROJECT/android"
+          if [ ! -f "$ANDROID/settings.gradle" ] && [ ! -f "$ANDROID/settings.gradle.kts" ]; then
+            echo "ERROR: settings.gradle/settings.gradle.kts tidak ditemukan di android/."
+            exit 1
+          fi
+
+          if [ ! -f "$ANDROID/gradlew" ]; then
+            echo "ERROR: android/gradlew tidak ditemukan. Project Genetic harus membawa Gradle Wrapper."
+            exit 1
+          fi
+
+          chmod +x "$ANDROID/gradlew"
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          echo "ANDROID=$ANDROID" >> "$GITHUB_ENV"
+
+          echo "=== Genetic structure ==="
+          find "$PROJECT" -maxdepth 2 -type f | sort | head -80
+
+      - name: Prepare projects with or without mipmap
+        run: |
+          set -euo pipefail
+          APP_RES="$ANDROID/app/src/main/res"
+
+          if [ ! -d "$ANDROID/app" ]; then
+            echo "ERROR: module android/app tidak ditemukan."
+            exit 1
+          fi
+
+          HAS_MIPMAP=0
+          if find "$APP_RES" -maxdepth 1 -type d -name 'mipmap*' -print -quit | grep -q .; then
+            HAS_MIPMAP=1
+          fi
+
+          echo "MIPMAP_PRESENT=$HAS_MIPMAP" >> "$GITHUB_ENV"
+
+          if [ "$HAS_MIPMAP" = "1" ]; then
+            echo "mipmap ditemukan -> resource asli dibiarkan."
+          else
+            echo "Tidak ada mipmap -> menggunakan fallback icon agar build tidak gagal hanya karena resource icon."
+
+            mkdir -p "$APP_RES/drawable"
+            cat > "$APP_RES/drawable/ic_launcher_fallback.xml" <<'XML'
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path android:fillColor="#FF616161" android:pathData="M0,0h48v48h-48z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M12,12h24v24h-24z" />
+</vector>
+XML
+
+            # If AndroidManifest.xml points to a mipmap icon that does not exist,
+            # switch only the missing application icon reference to the fallback.
+            MANIFEST="$ANDROID/app/src/main/AndroidManifest.xml"
+            if [ -f "$MANIFEST" ]; then
+              python3 - "$MANIFEST" "$APP_RES" <<'PY'
+import re, sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+res = Path(sys.argv[2])
+text = manifest.read_text(encoding="utf-8")
+
+refs = set(re.findall(r'@mipmap/([A-Za-z0-9_]+)', text))
+existing = set()
+for p in res.glob('mipmap*/**/*'):
+    if p.is_file():
+        existing.add(p.stem)
+
+missing = [name for name in refs if name not in existing]
+if missing:
+    text = re.sub(r'@mipmap/[A-Za-z0-9_]+', '@drawable/ic_launcher_fallback', text)
+    manifest.write_text(text, encoding="utf-8")
+    print("Replaced missing manifest mipmap references:", ", ".join(missing))
+else:
+    print("No missing manifest mipmap references.")
+PY
+            fi
+          fi
+
+      - name: Build Genetic APK
+        run: |
+          set -euo pipefail
+          cd "$ANDROID"
+
+          if [ "${{ inputs.build_type }}" = "debug" ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace
+            APK_DIR="$ANDROID/app/build/outputs/apk"
+          else
+            ./gradlew assembleRelease --no-daemon --stacktrace
+            APK_DIR="$ANDROID/app/build/outputs/apk"
+          fi
+
+          mkdir -p "$RUNNER_TEMP/output"
+          APK="$(find "$APK_DIR" -type f -name '*.apk' | sort | head -n1)"
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK tidak ditemukan setelah Gradle selesai."
+            find "$APK_DIR" -maxdepth 5 -type f -print || true
+            exit 1
+          fi
+
+          cp "$APK" "$RUNNER_TEMP/output/Genetic-${{ inputs.build_type }}-${{ inputs.tag }}.apk"
+          echo "APK=$RUNNER_TEMP/output/Genetic-${{ inputs.build_type }}-${{ inputs.tag }}.apk" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Genetic-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: ${{ env.APK }}
+          if-no-files-found: error
+          retention-days: 3
