@@ -1,0 +1,329 @@
+name: Android APK Builder - Flutter + Native
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project"
+        required: true
+      tag:
+        description: "Unique build tag"
+        required: true
+      build_type:
+        description: "debug or release"
+        required: true
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+      only_analyze:
+        description: "Analyze only"
+        required: false
+        default: "false"
+      user_id:
+        description: "Telegram user ID"
+        required: false
+        default: "unknown"
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf project_raw project.zip build-output build-logs
+          mkdir -p project_raw build-output build-logs
+          echo "Workspace ready."
+
+      - name: Download and prepare project
+        id: prepare
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+          USER_ID: ${{ inputs.user_id }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "📥 Downloading project..."
+          curl -fL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 600 \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            -o project.zip "$ZIP_URL"
+
+          test -s project.zip
+          unzip -t project.zip >/dev/null
+          unzip -q project.zip -d project_raw
+
+          SAFE_USER_ID="$(printf '%s' "${USER_ID:-unknown}" | tr -cd '0-9_-')"
+          [ -n "$SAFE_USER_ID" ] || SAFE_USER_ID="unknown"
+          USER_BUILD_DIR="$GITHUB_WORKSPACE/builds/$SAFE_USER_ID"
+          rm -rf "$GITHUB_WORKSPACE/builds"
+          mkdir -p "$USER_BUILD_DIR"
+          cp -a project_raw/. "$USER_BUILD_DIR/"
+
+          PUBSPEC="$(find "$USER_BUILD_DIR" -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' -not -path '*/.git/*' -print -quit || true)"
+
+          GRADLEW="$(find "$USER_BUILD_DIR" -type f -name gradlew \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+
+          SETTINGS="$(find "$USER_BUILD_DIR" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+
+          BUILD_GRADLE="$(find "$USER_BUILD_DIR" -type f \
+            \( -name build.gradle -o -name build.gradle.kts \) \
+            -not -path '*/.gradle/*' -not -path '*/.git/*' -print -quit || true)"
+
+          if [ -n "$PUBSPEC" ]; then
+            PROJECT_TYPE="flutter"
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          elif [ -n "$GRADLEW" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$GRADLEW")"
+          elif [ -n "$SETTINGS" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+          elif [ -n "$BUILD_GRADLE" ]; then
+            PROJECT_TYPE="native"
+            PROJECT_DIR="$(dirname "$BUILD_GRADLE")"
+          else
+            echo "::error::Project Flutter/Native tidak ditemukan."
+            echo "Marker yang dicari: pubspec.yaml, gradlew, settings.gradle(.kts), build.gradle(.kts)"
+            find "$USER_BUILD_DIR" -maxdepth 6 -type f | sort | head -300
+            exit 1
+          fi
+
+          echo "BUILD_DIR=$USER_BUILD_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_TYPE=$PROJECT_TYPE" >> "$GITHUB_ENV"
+          echo "SAFE_USER_ID=$SAFE_USER_ID" >> "$GITHUB_ENV"
+
+          {
+            echo "PROJECT_TYPE=$PROJECT_TYPE"
+            echo "PROJECT_DIR=$PROJECT_DIR"
+            echo "USER_BUILD_DIR=$USER_BUILD_DIR"
+            echo "PUBSPEC=${PUBSPEC:-not found}"
+            echo "GRADLEW=${GRADLEW:-not found}"
+            echo "SETTINGS=${SETTINGS:-not found}"
+          } | tee build-logs/project-analysis.txt
+
+      - name: Confirm build input
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "Workflow dispatch accepted."
+          echo "Build type: ${{ inputs.build_type }}"
+          echo "User ID: ${{ inputs.user_id }}"
+          echo "ZIP URL present: ${{ inputs.zip_url != '' }}"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Flutter
+        if: env.PROJECT_TYPE == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: Prepare Flutter Android host
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f gradlew ] && [ ! -f android/gradlew ]; then
+            flutter create --platforms=android --no-pub .
+          fi
+
+      - name: Flutter dependencies
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          flutter pub get 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-pub-get.log"
+
+      - name: Build Flutter APK
+        if: env.PROJECT_TYPE == 'flutter'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          TYPE="${{ inputs.build_type }}"
+          flutter build apk --"$TYPE" -v 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/flutter-build.log"
+
+      - name: Build Native Android APK
+        if: env.PROJECT_TYPE == 'native'
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG="$GITHUB_WORKSPACE/build-logs/native-build.log"
+
+          if [ "${{ inputs.only_analyze }}" = "true" ]; then
+            echo "Analyze-only requested; build skipped." | tee "$LOG"
+            exit 0
+          fi
+
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+            else
+              ./gradlew --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            fi
+          else
+            echo "⚠️ Gradle wrapper lengkap tidak tersedia. Menggunakan Gradle 8.4 langsung."
+            GRADLE_VERSION="8.4"
+            curl -fL --retry 3 -o "$RUNNER_TEMP/gradle.zip" \
+              "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip"
+            rm -rf "$RUNNER_TEMP/gradle"
+            unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP/gradle"
+            GRADLE_BIN="$RUNNER_TEMP/gradle/gradle-${GRADLE_VERSION}/bin/gradle"
+
+            if [ "${{ inputs.build_type }}" = "debug" ]; then
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleDebug 2>&1 | tee "$LOG"
+            else
+              "$GRADLE_BIN" --no-daemon --stacktrace assembleRelease 2>&1 | tee "$LOG"
+            fi
+          fi
+
+      - name: Collect APK and diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find "$GITHUB_WORKSPACE/project_raw" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          find "$GITHUB_WORKSPACE/builds" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' -exec cp -f {} build-output/ \; 2>/dev/null || true
+
+          # Resolve the real Android application name/package from the built APK.
+          # The APK artifact is renamed to the application label so Telegram receives
+          # e.g. "Toko Online.apk" instead of "flutter_<timestamp>.apk".
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -n "$APK" ]; then
+            AAPT="$(command -v aapt || true)"
+            if [ -z "$AAPT" ] && [ -n "${ANDROID_HOME:-}" ]; then
+              AAPT="$(find "$ANDROID_HOME/build-tools" -type f -name aapt -perm -111 2>/dev/null | sort -V | tail -n 1)"
+            fi
+
+            APK_LABEL=""
+            APK_PACKAGE=""
+            if [ -n "$AAPT" ]; then
+              BADGING="$($AAPT dump badging "$APK" 2>/dev/null || true)"
+              APK_PACKAGE="$(printf '%s\n' "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p" | head -n 1)"
+              APK_LABEL="$(printf '%s\n' "$BADGING" | sed -n "s/^application-label:'\([^']*\)'.*/\1/p" | head -n 1)"
+            fi
+
+            # Fallbacks if aapt is unavailable or the manifest has no explicit label.
+            if [ -z "$APK_LABEL" ]; then
+              APK_LABEL="${APK_PACKAGE:-Android-App}"
+            fi
+
+            # Sanitize only filesystem-dangerous characters; keep spaces and normal
+            # punctuation so the resulting Telegram filename is human-friendly.
+            SAFE_LABEL="$(printf '%s' "$APK_LABEL" | tr '/\\:' '---' | tr -d '\000' | sed 's/[<>"|?*]//g; s/[[:space:]][[:space:]]*/ /g; s/^ *//; s/ *$//')"
+            [ -n "$SAFE_LABEL" ] || SAFE_LABEL="Android-App"
+            SAFE_LABEL="${SAFE_LABEL%.}"
+            SAFE_LABEL="${SAFE_LABEL%.}"
+
+            INFO_TMP="build-output/apk-info.json.tmp"
+            printf '{"application_label":"%s","package_name":"%s"}\n' \
+              "$(printf '%s' "$APK_LABEL" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              "$(printf '%s' "$APK_PACKAGE" | sed 's/\\/\\\\/g; s/"/\\"/g')" \
+              > "$INFO_TMP"
+            mv "$INFO_TMP" build-output/apk-info.json
+
+            TARGET="build-output/${SAFE_LABEL}.apk"
+            if [ "$APK" != "$TARGET" ]; then
+              rm -f "$TARGET"
+              mv "$APK" "$TARGET"
+            fi
+            echo "APP_LABEL=$APK_LABEL"
+            echo "PACKAGE_NAME=$APK_PACKAGE"
+            echo "APK_FILENAME=$(basename "$TARGET")"
+          fi
+
+          {
+            echo "===== PROJECT ANALYSIS ====="
+            cat build-logs/project-analysis.txt 2>/dev/null || true
+            echo
+            echo "===== JAVA ====="
+            java -version 2>&1 || true
+            echo
+            echo "===== OUTPUT ====="
+            find build-output -maxdepth 1 -type f -exec ls -lh {} \; 2>/dev/null || true
+            echo
+            echo "===== BUILD LOG TAIL ====="
+            for f in build-logs/*build.log; do
+              [ -f "$f" ] || continue
+              echo "----- $f -----"
+              tail -n 300 "$f"
+            done
+          } > build-logs/final-diagnostic.txt 2>&1
+
+      - name: Upload APK
+        if: success() && inputs.only_analyze != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-${{ inputs.tag }}
+          path: build-output/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-logs-${{ inputs.tag }}
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Verify APK
+        if: success() && inputs.only_analyze != 'true'
+        shell: bash
+        run: |
+          APK="$(find build-output -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+          echo "✅ APK: $(basename "$APK")"
+          echo "📦 Size: $(du -h "$APK" | cut -f1)"
+
+      - name: Cleanup user folder
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${BUILD_DIR:-}" ] && [ -d "$BUILD_DIR" ]; then
+            rm -rf "$BUILD_DIR"
+            echo "🧹 User build folder cleared: builds/${SAFE_USER_ID:-unknown}"
+          fi
+          rm -f project.zip
+          rm -rf project_raw
