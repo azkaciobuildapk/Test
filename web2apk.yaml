@@ -1,0 +1,295 @@
+name: Web to APK Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website (http:// atau https://)"
+        required: true
+        type: string
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+        type: string
+      icon_url:
+        description: "URL icon PNG (opsional)"
+        required: false
+        default: ""
+        type: string
+      tag:
+        description: "Tag unik build"
+        required: true
+        type: string
+
+env:
+  WEB_URL: ${{ inputs.web_url }}
+  APP_NAME: ${{ inputs.app_name }}
+  ICON_URL: ${{ inputs.icon_url }}
+  BUILD_TAG: ${{ inputs.tag }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web2apk-build-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Validasi input
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WEB_URL:-}" ]; then
+            echo "::error::web_url kosong."
+            exit 1
+          fi
+
+          case "$WEB_URL" in
+            http://*|https://*) ;;
+            *)
+              echo "::error::URL harus diawali http:// atau https://"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "${APP_NAME:-}" ]; then
+            echo "::error::app_name kosong."
+            exit 1
+          fi
+
+          if [ -z "${BUILD_TAG:-}" ]; then
+            echo "::error::tag kosong."
+            exit 1
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+
+      - name: Buat project Flutter
+        run: |
+          set -e
+          flutter create \
+            --org com.tirzz.web2apk \
+            --project-name web2apk_app \
+            webapp
+
+      - name: Tambah WebView
+        working-directory: webapp
+        run: flutter pub add webview_flutter
+
+      - name: Tulis main.dart
+        working-directory: webapp
+        run: |
+          cat > lib/main.dart <<'EOF'
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          const kWebUrl = String.fromEnvironment(
+            'WEB_URL',
+            defaultValue: 'https://example.com',
+          );
+
+          const kAppName = String.fromEnvironment(
+            'APP_NAME',
+            defaultValue: 'WebView App',
+          );
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: kAppName,
+                debugShowCheckedModeBanner: false,
+                home: const WebViewPage(),
+              );
+            }
+          }
+
+          class WebViewPage extends StatefulWidget {
+            const WebViewPage({super.key});
+
+            @override
+            State<WebViewPage> createState() => _WebViewPageState();
+          }
+
+          class _WebViewPageState extends State<WebViewPage> {
+            late final WebViewController controller;
+            bool loading = true;
+
+            @override
+            void initState() {
+              super.initState();
+
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (_) {
+                      if (mounted) setState(() => loading = true);
+                    },
+                    onPageFinished: (_) {
+                      if (mounted) setState(() => loading = false);
+                    },
+                  ),
+                )
+                ..loadRequest(Uri.parse(kWebUrl));
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return PopScope(
+                canPop: false,
+                onPopInvokedWithResult: (didPop, result) async {
+                  if (didPop) return;
+
+                  if (await controller.canGoBack()) {
+                    await controller.goBack();
+                  } else if (context.mounted) {
+                    Navigator.of(context).pop();
+                  }
+                },
+                child: Scaffold(
+                  body: SafeArea(
+                    child: Stack(
+                      children: [
+                        WebViewWidget(controller: controller),
+                        if (loading)
+                          const Center(
+                            child: CircularProgressIndicator(),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Set nama aplikasi
+        working-directory: webapp
+        env:
+          NAME: ${{ inputs.app_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from xml.sax.saxutils import escape
+
+          path = "android/app/src/main/AndroidManifest.xml"
+          name = escape(os.environ["NAME"])
+
+          with open(path, encoding="utf-8") as f:
+              text = f.read()
+
+          text, count = re.subn(
+              r'android:label="[^"]*"',
+              f'android:label="{name}"',
+              text,
+              count=1
+          )
+
+          if count == 0:
+              raise SystemExit("android:label tidak ditemukan")
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(text)
+          PY
+
+      - name: Pasang icon opsional
+        if: ${{ inputs.icon_url != '' }}
+        working-directory: webapp
+        env:
+          ICON: ${{ inputs.icon_url }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p assets/icon
+          curl -fL --retry 3 "$ICON" -o assets/icon/icon.png
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("pubspec.yaml")
+          text = p.read_text()
+
+          if "flutter_launcher_icons:" not in text:
+              text += """
+          flutter_launcher_icons:
+            android: true
+            ios: false
+            image_path: assets/icon/icon.png
+          """
+
+          p.write_text(text)
+          PY
+
+          flutter pub add --dev flutter_launcher_icons
+          dart run flutter_launcher_icons
+
+      - name: Flutter pub get
+        working-directory: webapp
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: webapp
+        env:
+          URL: ${{ inputs.web_url }}
+          NAME: ${{ inputs.app_name }}
+        run: |
+          set -euo pipefail
+
+          flutter build apk --release \
+            --dart-define=WEB_URL="$URL" \
+            --dart-define=APP_NAME="$NAME"
+
+      - name: Kumpulkan APK
+        id: apk
+        run: |
+          set -euo pipefail
+
+          APK_PATH="$(find webapp/build/app/outputs/flutter-apk \
+            -type f -name '*.apk' | sort | head -n 1)"
+
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::APK tidak ditemukan."
+            exit 1
+          fi
+
+          mkdir -p apk_output
+
+          SAFE_TAG="$(printf '%s' "$BUILD_TAG" | \
+            tr -c 'A-Za-z0-9._-' '_')"
+
+          DEST="apk_output/web2apk-${SAFE_TAG}.apk"
+          cp "$APK_PATH" "$DEST"
+
+          echo "path=$DEST" >> "$GITHUB_OUTPUT"
+          echo "name=apk-build-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          retention-days: 1
+          if-no-files-found: error
